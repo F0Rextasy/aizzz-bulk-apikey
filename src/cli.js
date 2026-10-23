@@ -40,6 +40,20 @@ const HERE = __dirname;
 const BASE = (process.env.AIZZZ_BASE || 'https://aizzz.shop').replace(/\/$/, '');
 const KEYS = path.join(HERE, 'keys.txt');
 const ACCOUNTS = path.join(HERE, 'accounts.jsonl');
+/** Dead keys leave keys.txt and are parked here — repo root, like keys.txt. */
+const KEYS_DEAD_FILE = path.join(HERE, 'keys-dead.txt');
+/**
+ * A verdict only a dead key can answer — no exit, retry or model id changes it.
+ * 0 (transport), 429 and 5xx are excluded on purpose.
+ */
+const deadVerdict = (status, ok) => !ok && status !== 0 && status !== 429 && status < 500;
+/** key<TAB>reason<TAB>ISO date, one line per dead key, parked next to keys.txt. */
+function recordDeadKey(key, reason) {
+  try {
+    fs.mkdirSync(HERE, { recursive: true });
+    fs.appendFileSync(KEYS_DEAD_FILE, `${key}\t${String(reason).replace(/\s+/g, ' ').slice(0, 100)}\t${new Date().toISOString()}\n`);
+  } catch (e) { /* diagnostics must never break the run */ }
+}
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
 const MAILBOX_API = 'https://www.emailnator.com';
 
@@ -341,6 +355,7 @@ async function verifyKeys() {
     });
     const content = chatText(c);
     if (content) live++;
+    else if (deadVerdict(c.status, false)) recordDeadKey(key, `chat ${c.status}`);
     log(`verify ${key.slice(0, 12)}… models=${ids.length} chat=${content ? '200 ' + JSON.stringify(String(content).slice(0, 20)) : c.text.replace(/\s+/g, ' ').slice(0, 80)}`);
   }
   log(`verify done: ${live}/${keys.length} live`);
