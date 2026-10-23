@@ -5,10 +5,15 @@
  *
  * Panel: ZZ 中转站 (new-api fork).
  *
- * NOTE 2026-10-23: this panel runs an **e-mail domain allow-list** — gmail.com and outlook.com are
- * refused at `GET /api/verification` ("This email address is not allowed by the administrator's
- * email policy"), so the mint path only works from an address the panel accepts. The 1 surviving
- * account of the 2026-10-19 wave is revived with --revive.
+ * NOTE 2026-10-23: this panel runs an **e-mail domain allow-list**. Measured against 105 domains
+ * (consumer mail, temp-mail, the lab's mail rails, QQ siblings) exactly ONE passes the policy:
+ * **`qq.com`** — every other address, including the gmail boxes this tool mints with, is refused at
+ * `GET /api/verification` with "This email address is not allowed by the administrator's email
+ * policy". `qq.com` then fails one layer later on the foreign MX's own `550 … non-existent account`,
+ * so the mint path needs a *real* @qq.com mailbox, which no HTTP-only rail here can provision —
+ * `--count` is therefore dead until such a rail exists, and only `--revive` yields keys.
+ * (`GET /api/user/register` does NOT enforce the policy — register it and you get "Verification code
+ * is incorrect or has expired" — so probe the wall at /api/verification, not at register.)
  *
  * The panel is a new-api fork with **no captcha** (`turnstile_check=false`), e-mail
  * verification, and **daily check-in funding** (no sign-up bonus): `POST /api/user/checkin` paid
@@ -156,7 +161,11 @@ async function req(method, url, { body, headers = {}, exit = null } = {}) {
       });
       s.on('error', reject);
     };
-    if (u.protocol === 'https:') { const t = tls.connect({ socket: sock, servername: u.hostname }, () => onSock(t)); t.on('error', reject); }
+    // openTunnel clears the socket timeout once CONNECT succeeds; without re-arming it a
+    // stalled upstream hangs the whole run (measured: revive sat 39 min on one exit).
+    const guard = (s) => s.setTimeout(TIMEOUT_MS, () => s.destroy(new Error('timeout ' + u.hostname)));
+    guard(sock);
+    if (u.protocol === 'https:') { const t = tls.connect({ socket: sock, servername: u.hostname }, () => onSock(t)); guard(t); t.on('error', reject); }
     else onSock(sock);
   });
 }
@@ -349,29 +358,37 @@ async function reviveKeys() {
   let live = 0;
   for (const a of rows) {
     if (!a.username || !a.password) continue;
-    const exit = nextExit();
-    const li = await api('POST', '/api/user/login', { exit, body: { username: a.username, password: a.password } });
-    if (!(li.json && li.json.success)) { log('revive', a.email || a.username, 'login:', li.text.replace(/\s+/g, ' ').slice(0, 70)); continue; }
-    const auth = { authorization: 'Bearer ' + li.json.data.access_token };
-    const ci = await api('POST', '/api/user/checkin', { headers: auth, exit });
-    await api('POST', '/api/token/', { headers: auth, exit, body: { name: 'auto', remain_quota: 500000, expired_time: -1, unlimited_quota: false, model_limits_enabled: false, model_limits: '', allow_ips: '', group: 'default' } });
-    const list = await api('GET', '/api/token/?p=0&size=50', { headers: auth, exit });
-    const items = (list.json && list.json.data && (list.json.data.items || list.json.data)) || [];
-    const row = items.filter((t) => t.name === 'auto').pop() || items[0];
-    let key = row && row.key;
-    if (key && key.includes('*') && row.id) {
-      const rev = await api('POST', `/api/token/${row.id}/key`, { headers: auth, exit });
-      key = (rev.json && rev.json.data && rev.json.data.key) || key;
+    let done = false;
+    for (let t = 1; t <= 3 && !done; t++) {
+      const exit = nextExit();
+      try {
+        const li = await api('POST', '/api/user/login', { exit, body: { username: a.username, password: a.password } });
+        if (!(li.json && li.json.success)) { log('revive', a.email || a.username, 'login:', li.text.replace(/\s+/g, ' ').slice(0, 70)); done = true; break; }
+        const auth = { authorization: 'Bearer ' + li.json.data.access_token };
+        const ci = await api('POST', '/api/user/checkin', { headers: auth, exit });
+        await api('POST', '/api/token/', { headers: auth, exit, body: { name: 'auto', remain_quota: 500000, expired_time: -1, unlimited_quota: false, model_limits_enabled: false, model_limits: '', allow_ips: '', group: 'default' } });
+        const list = await api('GET', '/api/token/?p=0&size=50', { headers: auth, exit });
+        const items = (list.json && list.json.data && (list.json.data.items || list.json.data)) || [];
+        const row = items.filter((t2) => t2.name === 'auto').pop() || items[0];
+        let key = row && row.key;
+        if (key && key.includes('*') && row.id) {
+          const rev = await api('POST', `/api/token/${row.id}/key`, { headers: auth, exit });
+          key = (rev.json && rev.json.data && rev.json.data.key) || key;
+        }
+        const variants = !key ? [] : /^sk-/.test(key) ? [key, key.slice(3)] : [key, 'sk-' + key];
+        let ok = null;
+        for (const kk of variants) {
+          const c = await api('POST', '/v1/chat/completions', { headers: { authorization: 'Bearer ' + kk, 'content-type': 'application/json' }, exit, body: { model: MODEL, messages: [{ role: 'user', content: 'Reply with the single word: ok' }], max_tokens: 16, stream: false } });
+          const content = chatText(c);
+          if (content) { ok = kk; break; }
+        }
+        if (ok) { live++; if (!have.has(ok)) { fs.appendFileSync(KEYS, ok + '\n'); have.add(ok); } log('revive', a.email || a.username, 'LIVE', ok.slice(0, 12) + '…', 'checkin:', ci.text.replace(/\s+/g, ' ').slice(0, 50)); }
+        else log('revive', a.email || a.username, 'no live chat with a fresh token');
+        done = true;
+      } catch (e) {
+        log('revive', a.email || a.username, `try ${t}`, String(e.message).slice(0, 70));
+      }
     }
-    const variants = !key ? [] : /^sk-/.test(key) ? [key, key.slice(3)] : [key, 'sk-' + key];
-    let ok = null;
-    for (const kk of variants) {
-      const c = await api('POST', '/v1/chat/completions', { headers: { authorization: 'Bearer ' + kk, 'content-type': 'application/json' }, exit, body: { model: MODEL, messages: [{ role: 'user', content: 'Reply with the single word: ok' }], max_tokens: 16, stream: false } });
-      const content = chatText(c);
-      if (content) { ok = kk; break; }
-    }
-    if (ok) { live++; if (!have.has(ok)) { fs.appendFileSync(KEYS, ok + '\n'); have.add(ok); } log('revive', a.email || a.username, 'LIVE', ok.slice(0, 12) + '…', 'checkin:', ci.text.replace(/s+/g, ' ').slice(0, 50)); }
-    else log('revive', a.email || a.username, 'no live chat with a fresh token');
     await sleep(1500);
   }
   log(`revive done: ${live}/${rows.length} live -> ${KEYS}`);
